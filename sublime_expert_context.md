@@ -564,6 +564,315 @@ and any(ml.nlu_classifier(body.html.display_text).intents,
 
 ---
 
+## 5b. MQL Expert Notes — Patterns, Gotchas, and What Actually Works
+
+These are practical notes from real detection rule development sessions. They go beyond syntax reference and capture what makes rules precise, performant, and maintainable.
+
+---
+
+### Syntax Gotchas
+
+**`strings.ilike` argument order with list iteration**
+
+The most common MQL bug. The iterator `.` must be passed as the *second* argument to `strings.ilike`, not chained after it:
+
+```mql
+// WRONG — will not compile
+any($org_brand_names, strings.ilike(body.current_thread.text) .)
+
+// CORRECT
+any($org_brand_names, strings.ilike(body.current_thread.text, .))
+```
+
+The `.` inside `any(list, predicate)` is the current element of the list. Pass it as the pattern argument, not as a field accessor.
+
+**`ilike` vs `icontains` — know which one to use**
+
+- `icontains` — case-insensitive literal substring search. No wildcards. Use when your list or string is a plain value (e.g., brand names, domain names, keywords).
+- `ilike` — case-insensitive glob match. Supports `*` wildcards. Use when you need flexible patterns like `*phishing*link*` or when your list contains glob patterns.
+
+```mql
+// List of plain brand names → use icontains
+any($org_display_names, strings.icontains(body.current_thread.text, .))
+
+// List of glob patterns → use ilike
+any($brand_patterns, strings.ilike(body.current_thread.text, .))
+
+// Multiple patterns in one call — any match returns true
+strings.ilike(body.current_thread.text, "*gift card*", "*egift*", "*e-gift*")
+```
+
+**List variable names must actually exist**
+
+`$org_brand_names` is not a built-in list — it does not exist by default. Use real list names: `$org_display_names`, `$org_vips`, `$org_domains`, `$free_email_providers`, etc. Custom lists must be created in the tenant before they can be referenced in MQL.
+
+**Iterator field access inside nested functions**
+
+When you're inside a nested `any()` or `filter()` call, `.` refers to the current element of the inner array. Use `..` to reference the parent element:
+
+```mql
+// Inside filter on attachments, then checking the current attachment's PDF URLs
+any(filter(attachments, .file_type == "pdf"),
+    any(filter(.scan.pdf.urls,
+               not strings.istarts_with(.url, 'mailto:')
+               // ..scan.exiftool refers to the PARENT attachment, not the URL
+               and not strings.icontains(..scan.exiftool.producer, .domain.domain)
+        ),
+        true
+    )
+)
+```
+
+**`type.outbound` already implies external recipients**
+
+`type.outbound` is only true when there is at least one external recipient. Adding `any(recipients.to, .email.domain.root_domain not in $org_domains)` to an outbound rule is completely redundant — confirmed by the platform source code:
+
+```go
+mdm.Type.Outbound = internalSender && hasExternalRecipients
+```
+
+Remove the check; it adds noise without changing behavior.
+
+**`profile.by_sender().prevalence` valid values**
+
+The valid values are: `"new"`, `"outlier"`, `"uncommon"`, `"common"`. There is no `"rare"` — using it silently returns no matches. In practice, hunt rules sometimes use `"rare"` by mistake. Use `"outlier"` for very infrequent senders.
+
+---
+
+### Signal Layering (How Good Rules Are Structured)
+
+The standard pattern for high-precision rules: **hard required conditions + "N of" optional signals**.
+
+```mql
+type.inbound
+
+// Required conditions (must all match)
+and strings.ilike(body.current_thread.text, "*gift card*", "*egift*")
+and strings.ilike(body.current_thread.text, "*reimburse*", "*pay*back*")
+
+// Soft signals — require 2 of these 5 to reduce FPs without over-specifying
+and 2 of (
+  strings.ilike(body.current_thread.text, "*hospital*", "*birthday*", "*emergency*"),
+  strings.ilike(body.current_thread.text, "*amazon*", "*airbnb*", "*itunes*"),
+  regex.icontains(body.current_thread.text, 'send.{1,20}(?:email|to her|to him)'),
+  sender.email.domain.root_domain in $free_email_providers,
+  length(body.current_thread.text) < 500
+)
+
+// Sender negations
+and profile.by_sender().prevalence in ("new", "outlier")
+and not profile.by_sender().solicited
+and not profile.by_sender().any_messages_benign
+```
+
+**Why this works:**
+- The required conditions define the attack pattern
+- N-of signals add confidence without creating a brittle rule that fails if one signal is missing
+- Sender negations are the last line of FP defense — `solicited` alone cuts most legitimate senders
+
+**NLU alone is noisy.** It fires on legitimate financial communications, marketing emails, HR comms. Layer it:
+
+```mql
+// NLU as one of multiple signals — not as the only gating condition
+and (
+  any(ml.nlu_classifier(body.current_thread.text).intents,
+      .name == "bec" and .confidence in ("medium", "high")
+  )
+  or any(ml.nlu_classifier(body.current_thread.text).tags,
+         .name in ("urgency", "payment_card")
+  )
+)
+// Plus structural signals to tighten it
+and profile.by_sender().prevalence in ("new", "outlier")
+and not profile.by_sender().solicited
+```
+
+**For broad hunts, strip the N-of and NLU requirements.** Start with the core structural signals, see what you catch, then tighten:
+
+```mql
+// Hunt: broad sweep first
+type.inbound
+and strings.ilike(body.current_thread.text, "*gift card*")
+and strings.ilike(body.current_thread.text, "*reimburse*", "*pay*back*")
+and (
+  sender.email.domain.root_domain in $free_email_providers
+  or profile.by_sender().prevalence != "common"
+)
+```
+
+---
+
+### ML Function Guidance
+
+**`ml.nlu_classifier` — intents vs topics vs tags**
+
+- `.intents` — what the message is trying to do: `bec`, `cred_theft`, `callback_scam`, `urgency`, `financial_request`, `job_scam`, `extortion`, `steal_pii`, `vendor_fraud`, `recruiting`
+- `.topics` — content category: `"B2B Cold Outreach"`, `"Events and Webinars"`, `"Newsletter"`, `"Professional and Career Development"`, `"Advertising and Promotions"` — good for graymail
+- `.tags` — specific named entities: `gift_card`, `payment_card`, `simulation`
+
+Confidence values: `"high"`, `"medium"`, `"low"`. In production rules, gate on `("high", "medium")`. For hunts, try just `.name == "bec"` without confidence filter to cast wider.
+
+**`ml.link_analysis` — cost and modes**
+
+Link analysis launches a headless browser. It is the most expensive ML function in MQL. Always pre-filter links before calling it:
+
+```mql
+// EXPENSIVE — calls link analysis on every single link
+any(body.links, ml.link_analysis(.href_url.url).credphish.disposition == "phishing")
+
+// BETTER — pre-filter to only suspicious links before running the headless browser
+any(filter(body.links,
+           not .href_url.domain.root_domain in $org_domains
+           and not strings.istarts_with(.href_url.url, "mailto:")
+    ),
+    ml.link_analysis(.href_url.url).credphish.disposition == "phishing"
+)
+```
+
+**Default vs aggressive mode** — they behave and cache differently:
+
+```mql
+// Default mode — follows standard redirects
+ml.link_analysis(.href_url.url).credphish.disposition
+
+// Aggressive mode — follows more redirects, harder pursuit of final destination
+ml.link_analysis(.href_url.url, mode="aggressive").credphish.disposition
+```
+
+Always test both when investigating a suspicious link in the rule editor. They are cached independently — one may have a result when the other returns `unknown`.
+
+---
+
+### Link Analysis Specifics
+
+**What the link analysis result fields mean:**
+
+- `submitted` — whether the URL was queued for analysis at message ingestion time
+- `retrieved` — whether the page was successfully fetched/crawled
+- `analyzed` — whether credphish classification was completed
+- `credphish.disposition` — the verdict: `"phishing"`, `"safe"`, `"inconclusive"`, `"unknown"`, `"error"`
+
+If `submitted: false` and `retrieved: false` and `credphish.disposition: "unknown"`, the URL was **never analyzed** at ingestion. This happens with:
+- Click-tracking wrappers (SendGrid `ct.sendgrid.net/ls/click`, etc.) — not followed by default mode
+- URLs that were not deemed high-risk enough to analyze during ingestion scoring
+- Aged messages: if a message was ingested days after sending, the URL may already be down
+
+**Caching behavior:** Link analysis results are cached at scan time. When you click "View" on a link in the Message Detail View, the UI makes a live request to the URL (not the cached version) — which means if the URL is dead or the campaign is over, you'll see a 404. The MQL result is the cached ingestion-time analysis. To see what was cached, query MQL in the Rule Editor against the specific message.
+
+**Click-tracking wrappers:** SendGrid, Mailchimp, and similar ESPs wrap destination URLs. Default link analysis usually does not follow these through. Aggressive mode may resolve them.
+
+**Timing considerations:** If you're hunting a campaign that ran 4 days ago, link analysis `credphish.disposition` may be `"unknown"` even on confirmed phishing messages — the attacker may have pulled infrastructure by the time Sublime analyzed it or you ran the hunt. Use the URL structure and domain age signals as primary indicators in those cases.
+
+---
+
+### Body Field Selection
+
+Three main text fields and when to use each:
+
+| Field | Contents | Best For |
+|---|---|---|
+| `body.current_thread.text` | Latest reply only — quoted/forwarded text stripped | NLU classification, BEC detection, content matching in active conversation |
+| `body.html.display_text` | All rendered visible text, including quoted thread | Searching full thread history, finding text buried in replies |
+| `body.html.raw` | Raw HTML source | Finding obfuscated content, hidden elements, specific HTML patterns |
+
+**For NLU, always use `body.current_thread.text`.** If you use `body.html.display_text` or the full body, the classifier will pick up quoted thread content and can misclassify legitimate emails based on a previous phishing message someone replied to.
+
+**For string searches across the whole email thread**, `body.html.display_text` is more complete but slower. Use `body.current_thread.text` first; only fall back to `display_text` if you need to catch patterns buried in the thread history.
+
+**For HTML structure or encoding tricks**, use `body.html.raw`:
+
+```mql
+// Detect base64 obfuscation in HTML
+strings.icontains(body.html.raw, "fromCharCode")
+or strings.icontains(body.html.raw, "unescape")
+or strings.icontains(body.html.raw, "atob(")
+```
+
+---
+
+### Hunt-Specific Behavior (What's Different in Hunt Context)
+
+**`profile.by_sender()` reflects current state, not historical state.**
+
+When you run a hunt over messages from 3 months ago, `profile.by_sender().prevalence` returns the sender's prevalence *right now*, not what it was at the time the message was delivered. A sender who was `"new"` when they sent the phishing campaign will now show as `"common"` if they've continued emailing your org since. This means:
+
+- Hunt rules with `prevalence in ("new", "outlier")` will miss attacks from senders that have since built up a history
+- For historical hunts, lean on structural signals (domain age, auth headers, link patterns) over behavioral profile signals
+- `profile.by_sender().solicited` has the same limitation — a sender may be solicited now because someone emailed them back after the original attack was reviewed as benign
+
+**List variables may not be populated in demo/new tenants.**
+
+`$org_vips`, `$org_display_names`, `$org_domains`, and custom lists need to be populated for list-based checks to work. In a fresh HIP tenant or demo environment, these may be empty — rules using them will always return false until the lists are configured.
+
+**Validate in the Rule Editor before running as a Hunt.**
+
+The Rule Editor lets you run MQL against a specific message and see why it matched or didn't. Use it to confirm a rule works on at least one known-good example before launching a multi-week hunt job. Hunting is async and you want to catch bad MQL before waiting for results.
+
+---
+
+### Naming, Tagging, and Rule Style
+
+**Rule name format:** `"AttackType: Specific description of the pattern"`
+
+Examples from production:
+- `"BEC/Fraud: Gift card scam with declined card and urgent excuse"`
+- `"Hunt: Microsoft unusual sign-in activity alerts"`
+- `"Attachment: ICS file with meeting prefix"`
+- `"Impersonation: Internal corporate services"`
+
+Hunt rules get the `"Hunt: "` prefix so they're easy to filter out of production rule lists.
+
+**YAML filename:** snake_case, attack-type first:
+- `bec_gift_card_reimbursement_scam.yml`
+- `hunt_zohostratus_redirect_ip.yml`
+- `attachment_ics_meeting_invite.yml`
+
+**YAML structure** — always include these fields for community-style rules:
+
+```yaml
+name: "BEC/Fraud: Gift card scam"
+description: |
+  Two-sentence description: what attack it detects, and what specific pattern makes it distinctive.
+type: "rule"
+severity: "high"       # high for confirmed patterns, medium for hunting
+source: |
+  type.inbound
+  // ... MQL here
+attack_types:
+  - "BEC/Fraud"
+tactics_and_techniques:
+  - "Social engineering"
+  - "Impersonation: Executive"
+detection_methods:
+  - "Content analysis"
+  - "Natural Language Understanding"
+  - "Sender analysis"
+tags:
+  - "type:attack:bec"
+id: "uuid-here"
+```
+
+**In-MQL comments** use `//` and should explain the *intent* of a condition group, not just restate it:
+
+```mql
+// gift card terminology (required — this is the hard gate)
+and strings.ilike(body.current_thread.text, "*gift card*", "*egift*")
+
+// 2 of 5 additional scam signals — don't require all to avoid brittleness
+and 2 of (...)
+```
+
+**Severity guidelines:**
+- `high` — confident detection of a known attack pattern, validated against real samples
+- `medium` — hunting/broad detection, expected FP rate, needs tuning
+- `low` / `info` — monitoring, graymail, telemetry rules with no remediation action
+
+---
+
+*Section added May 2026 — extracted from real detection rule development sessions*
+
+---
+
 ## 6. Common Workflows
 
 ### Workflow 1: Hunt for a Threat Pattern
